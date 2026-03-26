@@ -16,7 +16,7 @@ import logging
 from functools import partial
 from typing import Iterable
 
-import modelopt.torch.distill as mtd
+#import modelopt.torch.distill as mtd
 import torch
 from megatron.core import parallel_state
 from megatron.core.models.gpt import GPTModel
@@ -30,7 +30,7 @@ from megatron.core.utils import (
 
 from megatron.bridge.training.config import ConfigContainer
 from megatron.bridge.training.losses import masked_next_token_loss
-from megatron.bridge.training.post_training.distillation import loss_func_kd
+#from megatron.bridge.training.post_training.distillation import loss_func_kd
 from megatron.bridge.training.state import GlobalState
 from megatron.bridge.training.utils.packed_seq_utils import get_packed_seq_params
 from megatron.bridge.training.utils.pg_utils import get_pg_collection

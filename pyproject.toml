@@ -138,6 +138,9 @@ url = "https://pypi.nvidia.com"
 megatron-core = { path = "3rdparty/Megatron-LM/", editable = true }
 nvidia-modelopt = { index = "nvidia" }
 
+[tool.uv.extra-build-dependencies]
+transformer-engine = ["setuptools"]
+
 [project.optional-dependencies]
 recipes = [
     "nemo-run",

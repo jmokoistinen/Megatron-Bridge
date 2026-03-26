@@ -352,7 +352,7 @@ def build_and_load_model(
             load_modelopt_state(model, checkpoint_path)
 
         maybe_state_dict = _load_model_weights_from_checkpoint(
-            checkpoint_path, model, return_state_dict=return_state_dict
+            checkpoint_path, model, return_state_dict=return_state_dict, dist_ckpt_strictness="log_unexpected"
         )
 
         if return_state_dict:
