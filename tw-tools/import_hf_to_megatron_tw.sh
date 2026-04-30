@@ -16,8 +16,9 @@
 
 #   sbatch import_hf_to_megatron_tw.sh Qwen/Qwen3.5-0.8B /custom/output/path
 
-#run tested at tw using:
-#sbatch import_hf_to_megatron_tw.sh Qwen/Qwen3.5-0.8B  /shared_silo/scratch/mika/models/megatron_ckpt/Qwen3.5-0.8B-test
+##Tested at tensorwave using:
+##sbatch tw-tools/import_hf_to_megatron_tw.sh Qwen/Qwen3.5-0.8B  /shared_silo/scratch/mika/models/megatron_ckpt/Qwen3.5-0.8B-test
+##sbatch tw-tools/import_hf_to_megatron_tw.sh Qwen/Qwen3.5-35B-A3B  /shared_silo/scratch/mika/models/megatron_ckpt/Qwen3.5-35B-A3B-test
 
 #SBATCH --job-name=hf-import
 #SBATCH --account=amd-tw-verification
@@ -37,9 +38,6 @@ HF_MODEL="${1:?Usage: sbatch $0 <hf_model> [megatron_output_path]}"
 
 # Outputs next to wherever you run sbatch from. Always overridable with the second argument. 
 MEGATRON_MODEL_PATH="${2:-./megatron_ckpt/$(basename "$HF_MODEL")}"
-
-#set your own path here
-#MEGATRON_PATH="${2:-/shared_silo/scratch/mika/models/megatron_ckpt/$(basename "$HF_MODEL")}"
 
 #set your own path here
 BRIDGE_ROOT=/shared_silo/scratch/mika/experiments/Megatron-Bridge 
