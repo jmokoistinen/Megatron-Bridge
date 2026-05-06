@@ -33,14 +33,14 @@
 
 set -euo pipefail
 
-source ~/environment.sh 
+# source ~/environment.sh 
 HF_MODEL="${1:?Usage: sbatch $0 <hf_model> [megatron_output_path]}"
 
 # Outputs next to wherever you run sbatch from. Always overridable with the second argument. 
 MEGATRON_MODEL_PATH="${2:-./megatron_ckpt/$(basename "$HF_MODEL")}"
 
 #set your own path here
-BRIDGE_ROOT=/shared_silo/scratch/mika/experiments/Megatron-Bridge 
+BRIDGE_ROOT="./"
 
 CONTAINER="/shared_silo/scratch/containers/build-rocm_primus_v25.11_transformers-5.5.4_linear_FA/rocm_primus_v25.11_transformers-5.5.4_linear_FA.sif"
 BIND_PATH="${BIND_PATH:-/shared_silo/scratch}"
@@ -54,10 +54,11 @@ echo "  megatron_model_store_path: $MEGATRON_MODEL_PATH"
 echo "  bridge_root  : $BRIDGE_ROOT"
 echo "  job_id       : $SLURM_JOB_ID"
 echo "========================================"
+MEGATRON_PATH="/shared_silo/scratch/rluukkon/oellm/oellm-autoexp/submodules/Megatron-LM"
 
 apptainer exec --rocm \
     -B "${BIND_PATH}:${BIND_PATH}:rw" \
-    --env PYTHONPATH="${BRIDGE_ROOT}/python-packages:${BRIDGE_ROOT}/3rdparty/Megatron-LM:${BRIDGE_ROOT}/src" \
+    --env PYTHONPATH=$MEGATRON_PATH:${BRIDGE_ROOT}/src \
     --env HSA_FORCE_FINE_GRAIN_PCIE=1 \
     --env TRITON_CACHE_DIR=/tmp/triton-${SLURM_JOB_ID} \
     --env TORCHINDUCTOR_CACHE_DIR=/tmp/inductor-${SLURM_JOB_ID} \

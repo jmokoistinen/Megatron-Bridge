@@ -30,7 +30,8 @@ if TYPE_CHECKING:
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
-from modelopt.torch.quantization.utils import is_quantized
+# from modelopt.torch.quantization.utils import is_quantized
+is_quantized = False
 from safetensors.torch import save_file
 from transformers.configuration_utils import PretrainedConfig
 from typing_extensions import Unpack
