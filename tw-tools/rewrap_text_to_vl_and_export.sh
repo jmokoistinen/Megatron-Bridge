@@ -2,17 +2,18 @@
 # Re-wrap a Megatron-LM text-only Qwen3.5 checkpoint into a Bridge VL
 # checkpoint and export it to HuggingFace, on TensorWave MI325X.
 #
+# Vision-tower weights are sourced directly from the original HF model
+# (--hf-model), so no separate original VL Megatron checkpoint is needed.
+#
 # Usage:
 #   sbatch tw-tools/rewrap_text_to_vl_and_export.sh \
-#       <trained_text_ckpt> <original_vl_ckpt> <hf_model> <out_megatron_vl> <out_hf>
+#       <trained_text_ckpt> <hf_model> <out>
 #
 # Example:
 #   sbatch tw-tools/rewrap_text_to_vl_and_export.sh \
-#       /shared_silo/scratch/rluukkon/oellm/oellm-autoexp/output/qwen3_5_4B_tw_test/iter_0001000 \
-#       /shared_silo/scratch/rluukkon/oellm/Megatron-Bridge/megatron_ckpt/Qwen3.5-4B \
+#       /shared_silo/scratch/rluukkon/oellm/Megatron-Bridge/megatron_ckpt/Qwen3.5-4B-Base_fix3 \
 #       Qwen/Qwen3.5-4B-Base \
-#       /shared_silo/scratch/rluukkon/oellm/Megatron-Bridge/megatron_ckpt/Qwen3.5-4B-trained-vl \
-#       /shared_silo/scratch/rluukkon/oellm/Megatron-Bridge/hf_exports/Qwen3.5-4B-trained
+#       /shared_silo/scratch/rluukkon/oellm/Megatron-Bridge/roundtrip_conversion
 
 #SBATCH --job-name=qwen35-rewrap-export
 #SBATCH --account=amd-tw-verification
@@ -27,27 +28,23 @@
 
 set -euo pipefail
 
-TRAINED_TEXT_CKPT="${1:?Usage: sbatch $0 <trained_text_ckpt> <original_vl_ckpt> <hf_model> <out_megatron_vl> <out_hf>}"
-ORIGINAL_VL_CKPT="${2:?missing original_vl_ckpt}"
-HF_MODEL="${3:?missing hf_model}"
-OUT_MEGATRON_VL="${4:?missing out_megatron_vl}"
-OUT_HF="${5:?missing out_hf}"
+TRAINED_TEXT_CKPT="${1:?Usage: sbatch $0 <trained_text_ckpt> <hf_model> <out>}"
+HF_MODEL="${2:?missing hf_model}"
+OUT="${3:?missing out}"
 
 BRIDGE_ROOT="./"
 CONTAINER="/shared_silo/scratch/containers/build-rocm_primus_v25.11_transformers-5.5.4_linear_FA/rocm_primus_v25.11_transformers-5.5.4_linear_FA.sif"
 BIND_PATH="${BIND_PATH:-/shared_silo/scratch}"
 
 mkdir -p "${BRIDGE_ROOT}/logs-convert"
-mkdir -p "$(dirname "$OUT_MEGATRON_VL")"
-mkdir -p "$(dirname "$OUT_HF")"
+mkdir -p "$(dirname "$OUT")"
 
 echo "========================================"
 echo "Qwen3.5 re-wrap (text → VL) and HF export"
 echo "  trained text ckpt : $TRAINED_TEXT_CKPT"
-echo "  original VL ckpt  : $ORIGINAL_VL_CKPT"
 echo "  HF reference      : $HF_MODEL"
-echo "  out (Megatron VL) : $OUT_MEGATRON_VL"
-echo "  out (HF VL)       : $OUT_HF"
+echo "  out (HF VL)       : $OUT"
+echo "  out (Megatron VL) : ${OUT}_megatron_vl  [intermediate, can delete after]"
 echo "  bridge_root       : $BRIDGE_ROOT"
 echo "  job_id            : $SLURM_JOB_ID"
 echo "  bridge mode       : VL (BRIDGE_QWEN35_USE_VL=1)"
@@ -68,11 +65,9 @@ apptainer exec --rocm \
     "$CONTAINER" \
     python "${BRIDGE_ROOT}/tw-tools/rewrap_text_to_vl_and_export.py" \
         --trained-text-ckpt "$TRAINED_TEXT_CKPT" \
-        --original-vl-ckpt  "$ORIGINAL_VL_CKPT" \
         --hf-model          "$HF_MODEL" \
-        --out-megatron-vl   "$OUT_MEGATRON_VL" \
-        --out-hf            "$OUT_HF"
+        --out               "$OUT"
 
 echo "Done."
-echo "  Megatron VL ckpt : $OUT_MEGATRON_VL"
-echo "  HuggingFace VL   : $OUT_HF"
+echo "  HuggingFace VL   : $OUT"
+echo "  Megatron VL (intermediate): ${OUT}_megatron_vl"

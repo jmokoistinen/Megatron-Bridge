@@ -230,23 +230,34 @@ def _spotcheck_numerics(
     # Build a fresh GPTModel and populate it with HF weights via the bridge.
     # This mirrors what import_ckpt does internally, except we keep the model
     # in CPU memory and never call save_megatron_model.
-    from copy import deepcopy
-
     fresh = bridge.to_megatron_model(wrap_with_ddp=False, use_cpu_initialization=True)
-    fresh_unwrapped = unwrap_model(fresh)[0]
-    expected_state = {k: v.detach().cpu().clone() for k, v in fresh_unwrapped.state_dict().items()}
+    fresh_unwrapped = unwrap_model(fresh if isinstance(fresh, list) else [fresh])[0]
+    # TransformerEngine _extra_state entries can be None before the first forward;
+    # skip them — the spotcheck keys never reference _extra_state.
+    expected_state = {
+        k: v.detach().cpu().clone()
+        for k, v in fresh_unwrapped.state_dict().items()
+        if v is not None
+    }
 
-    # Load the saved checkpoint into a *separately built* fresh model (random
-    # init) and overwrite with the on-disk values.
-    skeleton_models = bridge.to_megatron_provider(load_weights=False).provide_distributed_model(
-        wrap_with_ddp=False,
-        use_cpu_initialization=True,
-    )
-    skeleton = unwrap_model(skeleton_models)[0]
-    sharded = skeleton.sharded_state_dict()
+    # Reuse the same model instance to load the on-disk checkpoint.
+    # expected_state is already captured above; loading overwrites the model
+    # in-place so we can then read saved_state from it.  Avoids a second
+    # model build (to_megatron_provider(load_weights=False) passes None as
+    # init_method which triggers TypeError in CPU-init mode).
+    sharded = fresh_unwrapped.sharded_state_dict()
     loaded = dist_checkpointing.load(sharded, str(iter_dir))
-    skeleton.load_state_dict(loaded, strict=True)
-    saved_state = {k: v.detach().cpu().clone() for k, v in skeleton.state_dict().items()}
+    # dist_checkpointing.load may include checkpoint-level metadata keys
+    # (e.g. "checkpoint_version", "iteration", "content_metadata") that are
+    # not model parameters -- strip them before calling load_state_dict.
+    model_param_keys = set(fresh_unwrapped.state_dict().keys())
+    loaded_model_only = {k: v for k, v in loaded.items() if k in model_param_keys}
+    fresh_unwrapped.load_state_dict(loaded_model_only, strict=True)
+    saved_state = {
+        k: v.detach().cpu().clone()
+        for k, v in fresh_unwrapped.state_dict().items()
+        if v is not None
+    }
 
     failures = 0
     tol = 1e-4

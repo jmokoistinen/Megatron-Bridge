@@ -22,10 +22,10 @@ This is stage 3 of the text-only CPT pipeline:
     stage 2: oellm-autoexp Megatron-LM ``pretrain_gpt.py``
              continued pretraining on text data only
     stage 3: this script
-             1. load the *original* VL Megatron ckpt (vision tower preserved)
-             2. load the *trained* text Megatron ckpt (LM weights updated)
-             3. splice the trained LM weights into the VL model under the
-                ``language_model.`` prefix
+             1. load the *original* HF VL model (vision tower preserved)
+             2. convert it to a Megatron VL model in memory
+             3. overwrite the language_model.* weights with the trained
+                Megatron text checkpoint
              4. ``bridge.save_megatron_model`` -> a fresh Bridge VL ckpt
              5. ``bridge.export_ckpt`` -> HuggingFace VL safetensors
 
@@ -34,22 +34,19 @@ into ``in_proj_qkv/z/b/a``, RMSNorm zero-centering reverse, etc.) is handled
 entirely by the existing ``Qwen35VLBridge.mapping_registry()``; this script
 just stages the inputs.
 
-Vision parameters in the rewrapped checkpoint are byte-identical to the
-original HuggingFace release (they were never on a GPU during stage 2). The
-language model has CPT-updated weights. As a result the exported HF model
-will exhibit "plausibly degraded" VL capabilities: vision-language alignment
-will have drifted because the LM moved, but vision encoding itself is
-unchanged.
+Vision parameters in the output are byte-identical to the original HuggingFace
+release (they were never on a GPU during stage 2). The language model has
+CPT-updated weights. As a result the exported HF model will exhibit "plausibly
+degraded" VL capabilities: vision-language alignment will have drifted because
+the LM moved, but vision encoding itself is unchanged.
 
 Example (single-GPU)::
 
     BRIDGE_QWEN35_USE_VL=1 \\
     python rewrap_text_to_vl_and_export.py \\
-        --trained-text-ckpt /shared_silo/.../qwen3_5_4B_tw_test/iter_0001000 \\
-        --original-vl-ckpt  /shared_silo/.../megatron_ckpt/Qwen3.5-4B \\
+        --trained-text-ckpt /shared_silo/.../megatron_ckpt/Qwen3.5-4B-Base_fix3 \\
         --hf-model          Qwen/Qwen3.5-4B-Base \\
-        --out-megatron-vl   /shared_silo/.../megatron_ckpt/Qwen3.5-4B-trained-vl \\
-        --out-hf            /shared_silo/.../hf_exports/Qwen3.5-4B-trained
+        --out               /shared_silo/.../roundtrip_conversion
 """
 
 from __future__ import annotations
@@ -69,6 +66,7 @@ import torch  # noqa: E402
 
 from megatron.bridge import AutoBridge  # noqa: E402
 from megatron.core import dist_checkpointing  # noqa: E402
+from megatron.core.utils import init_method_normal, scaled_init_method_normal, unwrap_model  # noqa: E402
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -91,33 +89,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--original-vl-ckpt",
-        required=True,
-        type=str,
-        help=(
-            "Path to the *original* Megatron Bridge VL checkpoint produced by "
-            "``tw-tools/import_hf_to_megatron_tw.sh`` (i.e. the one whose "
-            "``run_config.yaml`` references ``Qwen35VLModelProvider``). Used as "
-            "the source of vision-tower weights and config."
-        ),
-    )
-    parser.add_argument(
         "--hf-model",
         required=True,
         type=str,
-        help="HuggingFace model id (e.g. ``Qwen/Qwen3.5-4B-Base``) used for tokenizer + auto-config.",
+        help=(
+            "HuggingFace model id or local path for the original VL model "
+            "(e.g. ``Qwen/Qwen3.5-4B-Base``). Used for both the VL bridge config "
+            "and as the source of vision-tower weights."
+        ),
     )
     parser.add_argument(
-        "--out-megatron-vl",
+        "--out",
         required=True,
         type=str,
-        help="Where to write the rewrapped Megatron Bridge VL checkpoint.",
-    )
-    parser.add_argument(
-        "--out-hf",
-        required=True,
-        type=str,
-        help="Where to write the final HuggingFace VL safetensors directory.",
+        help=(
+            "Output directory for the final HuggingFace VL safetensors. "
+            "An intermediate Megatron Bridge VL checkpoint is saved alongside "
+            "at ``<out>_megatron_vl`` and can be deleted after a successful export."
+        ),
     )
     parser.add_argument(
         "--strict-export",
@@ -198,25 +187,6 @@ def _iter_lm_pairs(gpt_state: dict, vl_state: dict) -> Iterable[tuple[str, str]]
             yield gpt_key, target
 
 
-def _is_gdn_out_norm_key(gpt_key: str) -> bool:
-    """Return True for the GDN ``out_norm.weight`` keys that need a semantic shift.
-
-    The text bridge (``Qwen35DenseTextProvider``) sets
-    ``layernorm_zero_centered_gamma=False`` and stores HF's RMSNorm weight
-    untransformed, while the VL bridge (``Qwen35VLModelProvider``) keeps the
-    field at ``True`` *and* registers ``RMSNorm2ZeroCenteredRMSNormMapping``
-    only for ``out_norm.weight`` -- meaning the VL Megatron checkpoint slot
-    holds ``hf_value - 1.0``. Splicing the trained text value as-is would
-    leave the VL bridge's export adding 1 again, double-shifting the tensor
-    by +1 in the final HF safetensors. The ``-1`` we apply at splice time
-    cancels the bridge's re-add and preserves byte-identical math through
-    the round-trip.
-    """
-    if not gpt_key.endswith(".out_norm.weight"):
-        return False
-    return ".self_attention." in gpt_key
-
-
 def main() -> int:
     args = parse_args()
 
@@ -229,42 +199,81 @@ def main() -> int:
         )
 
     trained_text_iter_dir = _resolve_iter_dir(args.trained_text_ckpt)
-    logger.info("Trained text checkpoint:   %s", trained_text_iter_dir)
-    logger.info("Original VL checkpoint:    %s", args.original_vl_ckpt)
-    logger.info("HuggingFace reference:     %s", args.hf_model)
-    logger.info("Output (Megatron VL):      %s", args.out_megatron_vl)
-    logger.info("Output (HuggingFace VL):   %s", args.out_hf)
+    out_hf = args.out
+    out_megatron_vl = str(Path(args.out).with_name(Path(args.out).name + "_megatron_vl"))
+
+    logger.info("Trained text checkpoint:        %s", trained_text_iter_dir)
+    logger.info("HuggingFace reference:          %s", args.hf_model)
+    logger.info("Output (HuggingFace VL):        %s", out_hf)
+    logger.info("Output (Megatron VL, intermediate): %s", out_megatron_vl)
 
     from megatron.bridge.training.model_load_save import temporary_distributed_context
 
     # ------------------------------------------------------------------
-    # Phase 1: load + splice + save the rewrapped VL checkpoint.
+    # Phase 1: build VL model from HF, overwrite LM weights, save.
     # ------------------------------------------------------------------
     with temporary_distributed_context(backend="gloo"):
-        # Build the VL bridge against the HF reference (config-only is enough
-        # since we'll overwrite with the original VL ckpt weights anyway).
         vl_bridge = AutoBridge.from_hf_pretrained(args.hf_model)
         logger.info("Loaded HF reference into AutoBridge: %s", type(vl_bridge._model_bridge).__name__)
 
-        # Load original VL Megatron checkpoint -> populates language_model.*,
-        # vision_model.*, merger.*, patch_embed.*, MTP, etc.
-        vl_models = vl_bridge.load_megatron_model(args.original_vl_ckpt, wrap_with_ddp=False)
-        if not isinstance(vl_models, list):
-            vl_models = [vl_models]
-        logger.info("Loaded VL Megatron checkpoint: %d model shard(s)", len(vl_models))
-
-        # Build a text-only GPTModel matching the trained checkpoint and load it.
+        # Build the text-only GPTModel FIRST, before to_megatron_model().
+        # provide() is a low-level call that hits _initialize_affine_weight_gpu
+        # with init_method=None when no Megatron CLI args have been parsed.
+        # provide_distributed_model(use_cpu_initialization=True) routes through
+        # CPU init which doesn't require init_method, matching what to_megatron_model()
+        # does internally.
         text_provider = _build_text_provider(vl_bridge)
-        gpt_model = text_provider.provide(pre_process=True, post_process=True)
+        # TransformerConfig.__post_init__ should set init_method from init_method_std,
+        # but in the bridge dataclass inheritance chain it may be skipped. Set it
+        # explicitly so module constructors (MLP, attention) that call not_none(config.init_method)
+        # don't crash. The actual values are irrelevant: perform_initialization=False (below)
+        # ensures no random init is applied -- weights are loaded from the checkpoint.
+        if text_provider.init_method is None:
+            _std = text_provider.init_method_std or 0.02
+            text_provider.init_method = init_method_normal(_std)
+        if text_provider.output_layer_init_method is None:
+            _std = text_provider.init_method_std or 0.02
+            text_provider.output_layer_init_method = scaled_init_method_normal(
+                _std, text_provider.num_layers
+            )
+        # Skip random weight initialization: weights are loaded from the trained
+        # checkpoint immediately after. This mirrors what to_megatron_model(load_weights=True)
+        # does internally (auto_bridge.py line 1330) and avoids TypeError when init_method
+        # is None (no Megatron CLI args have been parsed to supply it).
+        text_provider.perform_initialization = False
+        gpt_model_list = text_provider.provide_distributed_model(
+            wrap_with_ddp=False,
+            use_cpu_initialization=True,
+        )
+        gpt_model = unwrap_model(
+            gpt_model_list if isinstance(gpt_model_list, list) else [gpt_model_list]
+        )[0]
         gpt_sharded = gpt_model.sharded_state_dict()
         logger.info("Bare GPTModel built; %d sharded entries", len(gpt_sharded))
 
         loaded_gpt = dist_checkpointing.load(gpt_sharded, str(trained_text_iter_dir))
-        gpt_model.load_state_dict(loaded_gpt, strict=True)
+        # dist_checkpointing.load may return checkpoint-level metadata keys
+        # (e.g. "checkpoint_version", "iteration") alongside model weights.
+        model_param_keys = set(gpt_model.state_dict().keys())
+        gpt_model.load_state_dict(
+            {k: v for k, v in loaded_gpt.items() if k in model_param_keys},
+            strict=True,
+        )
         logger.info("Trained text checkpoint loaded into GPTModel (%d tensors).", len(loaded_gpt))
 
+        # Now build the full VL model from the original HF weights. Vision-tower
+        # weights come from HF directly; LM weights will be overwritten below.
+        vl_models = vl_bridge.to_megatron_model(wrap_with_ddp=False, use_cpu_initialization=True)
+        if not isinstance(vl_models, list):
+            vl_models = [vl_models]
+        logger.info(
+            "Built VL model from HF weights: %d shard(s). "
+            "Vision-tower weights are populated; LM weights will be overwritten.",
+            len(vl_models),
+        )
+
         # ------------------------------------------------------------------
-        # Splice trained LM weights into VL model.language_model.*
+        # Overwrite language_model.* in the VL model with the trained weights.
         # ------------------------------------------------------------------
         gpt_state = dict(gpt_model.state_dict())
         # Strip any "module." prefix that Megatron's DDP/wrapper might add.
@@ -275,27 +284,26 @@ def main() -> int:
         n_copied = 0
         n_lm_keys_in_vl = 0
         n_skipped = 0
-        n_zero_centered_shifts = 0
         for vl_model in vl_models:
             vl_state = dict(vl_model.state_dict())
             n_lm_keys_in_vl = sum(1 for k in vl_state if k.startswith("language_model."))
             for gpt_key, vl_key in _iter_lm_pairs(gpt_state, vl_state):
                 src = gpt_state[gpt_key]
                 dst = vl_state[vl_key]
+                # TransformerEngine stores opaque _extra_state buffers as None in
+                # state_dict(); skip them (they are not trainable weights).
+                if src is None or dst is None:
+                    continue
                 if dst.shape != src.shape:
                     raise ValueError(
                         f"Shape mismatch on rewrap: gpt[{gpt_key}]={tuple(src.shape)} vs "
                         f"vl[{vl_key}]={tuple(dst.shape)}. Did the text bridge and VL bridge "
                         f"produce mismatched architectures (head_dim, num_query_groups, ...)?"
                     )
-                value = src.to(dst.dtype)
-                if _is_gdn_out_norm_key(gpt_key):
-                    # See _is_gdn_out_norm_key for the math: text uses
-                    # zero-centered=False (HF passthrough), VL uses
-                    # zero-centered=True with a -1 import shift on this key.
-                    value = value - 1.0
-                    n_zero_centered_shifts += 1
-                dst.copy_(value)
+                # Both bridges use layernorm_zero_centered_gamma=True with
+                # RMSNorm2ZeroCenteredRMSNormMapping for out_norm.weight, so
+                # both store w_hf - 1. No per-key semantic adjustment needed.
+                dst.copy_(src.to(dst.dtype))
                 n_copied += 1
 
             untouched = [
@@ -304,20 +312,18 @@ def main() -> int:
                 if k.startswith("language_model.") and k.removeprefix("language_model.") not in gpt_state
             ]
             for k in untouched:
-                logger.info("[keep-original] %s", k)
+                logger.info("[keep-hf] %s", k)
                 n_skipped += 1
             untouched_gpt = [k for k in gpt_state if f"language_model.{k}" not in vl_state]
             for k in untouched_gpt:
                 logger.warning("[orphan-trained] %s (no matching language_model.* in VL)", k)
 
         logger.info(
-            "Spliced %d trained LM tensors into VL model "
-            "(%d total LM keys in VL; %d retained from original VL ckpt; "
-            "%d zero-centered-gamma shifts applied to GDN out_norm.weight).",
+            "Overwrote %d LM tensors in VL model "
+            "(%d total LM keys in VL; %d retained from original HF).",
             n_copied,
             n_lm_keys_in_vl,
             n_skipped,
-            n_zero_centered_shifts,
         )
 
         # Free the GPTModel before save to reduce peak memory.
@@ -332,27 +338,26 @@ def main() -> int:
         # ------------------------------------------------------------------
         vl_bridge.save_megatron_model(
             vl_models,
-            args.out_megatron_vl,
+            out_megatron_vl,
             hf_tokenizer_path=args.hf_model,
             low_memory_save=True,
         )
-        logger.info("Wrote rewrapped Megatron VL checkpoint to %s", args.out_megatron_vl)
+        logger.info("Wrote rewrapped Megatron VL checkpoint to %s", out_megatron_vl)
 
     # ------------------------------------------------------------------
     # Phase 2: HuggingFace export (opens its own dist context).
     # ------------------------------------------------------------------
     export_bridge = AutoBridge.from_hf_pretrained(args.hf_model)
     export_bridge.export_ckpt(
-        args.out_megatron_vl,
-        args.out_hf,
+        out_megatron_vl,
+        out_hf,
         show_progress=True,
         strict=args.strict_export,
     )
-    logger.info("Wrote HuggingFace VL safetensors to %s", args.out_hf)
+    logger.info("Wrote HuggingFace VL safetensors to %s", out_hf)
 
     if not args.keep_megatron_vl:
-        # Optional: leave a breadcrumb so it is obvious the user can delete this.
-        breadcrumb = Path(args.out_megatron_vl) / "_REWRAP_INTERMEDIATE.md"
+        breadcrumb = Path(out_megatron_vl) / "_REWRAP_INTERMEDIATE.md"
         try:
             breadcrumb.write_text(
                 "This checkpoint was produced by rewrap_text_to_vl_and_export.py as an\n"

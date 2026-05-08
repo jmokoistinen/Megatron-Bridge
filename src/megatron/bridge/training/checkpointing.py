@@ -53,11 +53,22 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer import MegatronModule
 from megatron.core.utils import get_pg_size, unwrap_model
-from modelopt.torch.opt.plugins import (
-    restore_modelopt_state,
-    save_modelopt_state,
-    save_sharded_modelopt_state,
-)
+try:
+    from modelopt.torch.opt.plugins import (
+        restore_modelopt_state,
+        save_modelopt_state,
+        save_sharded_modelopt_state,
+    )
+except ImportError:
+
+    def restore_modelopt_state(model, state_dict):
+        pass
+
+    def save_modelopt_state(model, state_dict):
+        pass
+
+    def save_sharded_modelopt_state(model, state_dict, checkpoint_dir):
+        pass
 
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.training import fault_tolerance
