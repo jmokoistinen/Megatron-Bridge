@@ -27,9 +27,19 @@ This module provides two bridges:
 
 - ``Qwen35VLMoEBridge``: MoE variant (e.g., Qwen3.5-397B-A17B)
   Reference: https://huggingface.co/Qwen/Qwen3.5-397B-A17B
+
+Environment variables
+---------------------
+- ``BRIDGE_QWEN35_USE_VL`` (default: ``"0"``): when set to ``"1"``, register
+  :class:`Qwen35VLBridge` as the bridge for ``Qwen3_5ForConditionalGeneration``.
+  When unset/``"0"``, the dense VL bridge is **not** registered, leaving the
+  text-only :class:`~megatron.bridge.models.qwen.qwen3_5_dense_bridge.Qwen35DenseTextBridge`
+  to handle the dense architecture. Use the VL bridge when you need round-trip
+  with the full vision-language model (e.g. for HF export at the end of CPT).
 """
 
 import logging
+import os
 
 import torch
 
@@ -431,12 +441,29 @@ class Qwen35VLMoEBridge(MegatronModelBridge):
         return MegatronMappingRegistry(*mapping_list)
 
 
-@MegatronModelBridge.register_bridge(
-    source=_QWEN3_5_DENSE_HF_CLASS_NAME,
-    target=Qwen3VLModel,
-    provider=Qwen35VLModelProvider,
-    model_type="qwen3_5",
-)
+_ENABLE_QWEN35_VL_DENSE_BRIDGE = os.environ.get("BRIDGE_QWEN35_USE_VL", "0") == "1"
+
+
+def _maybe_register_dense_vl_bridge(cls):
+    """Conditionally register the dense VL bridge based on ``BRIDGE_QWEN35_USE_VL``.
+
+    Defining the class is unconditional (so it remains importable for the
+    re-wrap/export script) but the dispatch registration is only applied when
+    the environment variable is set, so the text-only
+    :class:`Qwen35DenseTextBridge` wins by default.
+    """
+
+    if not _ENABLE_QWEN35_VL_DENSE_BRIDGE:
+        return cls
+    return MegatronModelBridge.register_bridge(
+        source=_QWEN3_5_DENSE_HF_CLASS_NAME,
+        target=Qwen3VLModel,
+        provider=Qwen35VLModelProvider,
+        model_type="qwen3_5",
+    )(cls)
+
+
+@_maybe_register_dense_vl_bridge
 class Qwen35VLBridge(MegatronModelBridge):
     """
     Megatron Bridge for Qwen3.5 Dense Vision-Language Model.

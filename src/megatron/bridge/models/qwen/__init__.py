@@ -13,6 +13,10 @@
 # limitations under the License.
 
 from megatron.bridge.models.qwen.qwen2_bridge import Qwen2Bridge  # noqa: F401
+from megatron.bridge.models.qwen.qwen3_5_dense_bridge import (  # noqa: F401
+    Qwen35DenseTextBridge,
+    Qwen35DenseTextProvider,
+)
 from megatron.bridge.models.qwen.qwen3_bridge import Qwen3Bridge  # noqa: F401
 from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge  # noqa: F401
 from megatron.bridge.models.qwen.qwen3_next_bridge import Qwen3NextBridge  # noqa: F401
