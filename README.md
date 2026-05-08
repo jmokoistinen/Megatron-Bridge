@@ -242,6 +242,82 @@ Megatron-Bridge/
 └── tests/                       # Comprehensive test suite
 ```
 
+## Qwen3.5 Text-Only Continued Pretraining (TensorWave)
+
+This section documents the end-to-end workflow for continued pretraining a Qwen3.5 dense model as a text-only `GPTModel` in Megatron-LM and exporting the trained weights back to HuggingFace.  The pipeline is implemented in `tw-tools/` and has been validated on **Qwen3.5-4B-Base** on AMD MI325X hardware.
+
+### Architecture notes
+
+The HuggingFace `Qwen3.5-4B-Base` checkpoint carries the class `Qwen3_5ForConditionalGeneration`, which includes a vision tower alongside the language model.  The language model itself is a **hybrid Gated-DeltaNet (GDN) + Gated-Attention** architecture (Qwen3-Next style): every 4th layer is a full-attention layer; the remaining 3 are GDN (state-space) layers.  This requires special handling in the bridge because the GDN `in_proj` and `out_norm` weights need non-trivial remapping.
+
+### Stage 1 — HuggingFace → Megatron text-only checkpoint
+
+```bash
+cd /path/to/Megatron-Bridge
+
+sbatch tw-tools/import_hf_to_megatron_tw_text.sh \
+    Qwen/Qwen3.5-4B-Base \
+    ./megatron_ckpt/Qwen3.5-4B-Base
+```
+
+This produces a Megatron `torch_dist` checkpoint whose state-dict matches a plain `GPTModel` (no `language_model.` prefix, no vision keys).  The bridge is activated by leaving `BRIDGE_QWEN35_USE_VL` unset (default `0`).
+
+**Important Megatron-LM training flags** — add these to your `pretrain_gpt.py` sbatch script to match the bridge's RMSNorm convention:
+
+```bash
+--normalization RMSNorm \
+--layernorm-zero-centered-gamma \
+```
+
+And in your YAML config (`config/backend/megatron/qwen3_5_base.yaml`):
+
+```yaml
+normalization: RMSNorm
+layernorm_epsilon: 1e-6
+layernorm_zero_centered_gamma: true
+```
+
+### Stage 2 — Verify the checkpoint (optional but recommended)
+
+```bash
+sbatch tw-tools/verify_text_ckpt.sh ./megatron_ckpt/Qwen3.5-4B-Base
+```
+
+The script loads the checkpoint and checks that all parameter values are numerically consistent with the original HF weights.
+
+### Stage 3 — Continued pretraining
+
+Run `pretrain_gpt.py` with your data and the checkpoint from stage 1 as `--load`.  See `oellm-autoexp/output/qwen3_5_4B_tw_test/job.sbatch` for a working reference.
+
+### Stage 4 — Export trained weights back to HuggingFace VL
+
+```bash
+sbatch tw-tools/rewrap_text_to_vl_and_export.sh \
+    ./megatron_ckpt/Qwen3.5-4B-Base \   # trained Megatron text checkpoint
+    Qwen/Qwen3.5-4B-Base \              # original HF model (vision source)
+    ./roundtrip_conversion               # output directory
+```
+
+The script:
+1. Builds a text-only `GPTModel` and loads the trained checkpoint into it.
+2. Builds a full VL Megatron model from the original HF weights (preserving the vision tower byte-for-byte).
+3. Overwrites all `language_model.*` tensors in the VL model with the trained LM weights.
+4. Saves an intermediate Megatron VL checkpoint, then calls `export_ckpt` to produce a HuggingFace-format safetensors directory.
+
+The output at `./roundtrip_conversion/` is a valid `Qwen3_5ForConditionalGeneration` HF model that can be loaded with `AutoModelForCausalLM.from_pretrained`.
+
+### Roundtrip verification
+
+To confirm the conversion is lossless (e.g. after a base import with no training):
+
+```bash
+python oellm-autoexp/compare_roundtrip.py \
+    --orig /path/to/original/Qwen3.5-4B-Base \
+    --rt   ./roundtrip_conversion
+```
+
+This compares state dicts directly from safetensors shards, reporting max absolute difference and cosine similarity per key.  A perfect roundtrip produces `max_abs_diff == 0` for all keys.
+
 ## Acknowledgement & Contributing
 
 Megatron-Bridge is the continuation of [MBridge](https://github.com/ISEEKYAN/mbridge) by [Yan Bai](https://github.com/ISEEKYAN). We appreciate all the contribution and adoptions by the community partners:
