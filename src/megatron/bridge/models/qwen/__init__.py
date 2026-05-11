@@ -16,6 +16,8 @@ from megatron.bridge.models.qwen.qwen2_bridge import Qwen2Bridge  # noqa: F401
 from megatron.bridge.models.qwen.qwen3_5_dense_bridge import (  # noqa: F401
     Qwen35DenseTextBridge,
     Qwen35DenseTextProvider,
+    Qwen35MoETextBridge,
+    Qwen35MoETextProvider,
 )
 from megatron.bridge.models.qwen.qwen3_bridge import Qwen3Bridge  # noqa: F401
 from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge  # noqa: F401

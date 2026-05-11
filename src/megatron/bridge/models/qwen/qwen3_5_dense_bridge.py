@@ -70,9 +70,14 @@ from megatron.bridge.models.conversion.param_mapping import (
     QKVMapping,
     RMSNorm2ZeroCenteredRMSNormMapping,
 )
+from megatron.bridge.models.conversion.param_mapping import (
+    FusedExpertMapping,
+    FusedGatedExpertMapping,
+    ReplicatedMapping,
+)
 from megatron.bridge.models.conversion.utils import persistent_buffers
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
-from megatron.bridge.models.qwen_vl.qwen35_vl_provider import Qwen35VLModelProvider
+from megatron.bridge.models.qwen_vl.qwen35_vl_provider import Qwen35VLModelProvider, Qwen35VLMoEModelProvider
 
 
 logger = logging.getLogger(__name__)
@@ -441,6 +446,334 @@ class Qwen35DenseTextBridge(MegatronModelBridge):
         if problems:
             raise RuntimeError(
                 "Qwen35DenseTextBridge: silent conversion gap detected. "
+                "Aborting before save_megatron_model so the checkpoint is not "
+                "shipped with random-init parameters.\n\n" + "\n\n".join(problems)
+            )
+
+        return result
+
+
+# =============================================================================
+# MoE text-only bridge (Qwen3.5-35B-A3B and similar MoE variants)
+# =============================================================================
+
+_QWEN3_5_MOE_HF_CLASS_NAME = "Qwen3_5MoeForConditionalGeneration"
+
+
+@dataclass
+class Qwen35MoETextProvider(Qwen35VLMoEModelProvider):
+    """Text-only provider for Qwen3.5 MoE models (e.g. Qwen3.5-35B-A3B-Base).
+
+    Inherits all MoE-specific and LM fields from
+    :class:`Qwen35VLMoEModelProvider` but bypasses the vision bootstrap in
+    ``__post_init__`` (avoids eagerly constructing ``Qwen3_5MoeVisionConfig``)
+    and overrides ``provide()`` so only the language model is instantiated.
+    """
+
+    # Keep vision_config optional so __post_init__ doesn't raise on missing
+    # transformers vision config.
+    vision_config: Any = field(default=None)
+
+    # Zero-centered gamma must match the oellm-autoexp training config; see the
+    # analogous comment on Qwen35DenseTextProvider for the full rationale.
+    layernorm_zero_centered_gamma: bool = True
+
+    def __post_init__(self) -> None:
+        # Jump over Qwen35VLMoEModelProvider.__post_init__ (which calls
+        # _check_qwen3_5_moe_available() and constructs a vision config) to
+        # avoid hard-depending on the optional Qwen3_5MoeVisionConfig class.
+        super(Qwen35VLMoEModelProvider, self).__post_init__()
+
+    def provide(self, pre_process=None, post_process=None, vp_stage=None) -> GPTModel:
+        """Build a text-only Megatron-Core ``GPTModel`` (no vision tower)."""
+        return self.provide_language_model(
+            pre_process=pre_process,
+            post_process=post_process,
+            vp_stage=vp_stage,
+        )
+
+
+_ENABLE_QWEN35_MOE_TEXT_BRIDGE = os.environ.get("BRIDGE_QWEN35_MOE_USE_VL", "0") != "1"
+
+
+def _maybe_register_moe_text_bridge(cls):
+    """Register :class:`Qwen35MoETextBridge` only when the VL MoE bridge is not requested."""
+
+    if not _ENABLE_QWEN35_MOE_TEXT_BRIDGE:
+        return cls
+    return MegatronModelBridge.register_bridge(
+        source=_QWEN3_5_MOE_HF_CLASS_NAME,
+        target=GPTModel,
+        provider=Qwen35MoETextProvider,
+        model_type="qwen3_5_moe_text",
+    )(cls)
+
+
+@_maybe_register_moe_text_bridge
+class Qwen35MoETextBridge(MegatronModelBridge):
+    """Text-only Megatron Bridge for Qwen3.5 MoE models.
+
+    Maps a HuggingFace ``Qwen3_5MoeForConditionalGeneration`` checkpoint into a
+    Megatron-Core ``GPTModel``, dropping all vision and MTP parameters.
+
+    The mapping registry is the LM-only subset of
+    ``Qwen35VLMoEBridge.mapping_registry()`` with the ``language_model.`` prefix
+    removed from every Megatron-side key.  HuggingFace-side keys use the
+    ``model.`` prefix directly (the MoE base model does not have an extra
+    ``language_model.`` level).
+
+    Example::
+
+        >>> from megatron.bridge import AutoBridge
+        >>> AutoBridge.import_ckpt(
+        ...     hf_model_id="Qwen/Qwen3.5-35B-A3B-Base",
+        ...     megatron_path="./megatron_ckpt/Qwen3.5-35B-A3B-text",
+        ... )
+    """
+
+    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> Qwen35MoETextProvider:
+        """Create a ``Qwen35MoETextProvider`` from a HuggingFace pretrained model."""
+        hf_config = hf_pretrained.config
+        text_config = hf_config.text_config
+
+        provider_kwargs = self.hf_config_to_provider_kwargs(text_config)
+        provider = Qwen35MoETextProvider(**provider_kwargs)
+
+        provider.share_embeddings_and_output_weights = getattr(hf_config, "tie_word_embeddings", False)
+
+        # --- Common Qwen3 LLM settings ---
+        provider.normalization = "RMSNorm"
+        provider.gated_linear_unit = True
+        provider.add_qkv_bias = getattr(text_config, "attention_bias", False)
+        provider.add_bias_linear = False
+        provider.qk_layernorm = True
+        provider.hidden_dropout = 0.0
+
+        # --- Qwen3-Next hybrid architecture ---
+        provider.attention_output_gate = True
+        provider.experimental_attention_variant = "gated_delta_net"
+        provider.linear_attention_freq = getattr(text_config, "full_attention_interval", 4)
+        provider.rotary_percent = (
+            getattr(text_config, "rope_parameters", {}) or {}
+        ).get("partial_rotary_factor", 0.25)
+
+        # --- MoE specific parameters ---
+        provider.moe_ffn_hidden_size = getattr(text_config, "moe_intermediate_size", 1024)
+        provider.num_moe_experts = getattr(text_config, "num_experts", 256)
+        provider.moe_router_topk = getattr(text_config, "num_experts_per_tok", 8)
+        provider.moe_shared_expert_intermediate_size = getattr(
+            text_config, "shared_expert_intermediate_size", None
+        )
+        provider.moe_shared_expert_gate = True
+        provider.moe_grouped_gemm = True
+        provider.moe_router_load_balancing_type = "global_aux_loss"
+        provider.moe_router_pre_softmax = False
+        provider.moe_token_dispatcher_type = "alltoall"
+        provider.moe_permute_fusion = True
+
+        # --- Gated DeltaNet (GDN) parameters ---
+        provider.linear_conv_kernel_dim = getattr(text_config, "linear_conv_kernel_dim", 4)
+        provider.linear_key_head_dim = getattr(text_config, "linear_key_head_dim", 128)
+        provider.linear_value_head_dim = getattr(text_config, "linear_value_head_dim", 128)
+        provider.linear_num_key_heads = getattr(text_config, "linear_num_key_heads", 16)
+        provider.linear_num_value_heads = getattr(text_config, "linear_num_value_heads", 32)
+
+        # --- Position embedding ---
+        # Use plain rope for text-only training (same rationale as dense bridge).
+        provider.position_embedding_type = "rope"
+        provider.rotary_interleaved = False
+        provider.mrope_section = getattr(text_config, "rope_scaling", {}).get(
+            "mrope_section", [11, 11, 10]
+        )
+
+        # --- Token IDs ---
+        provider.bos_token_id = getattr(text_config, "bos_token_id", 248045)
+        provider.eos_token_id = getattr(text_config, "eos_token_id", 248044)
+
+        # --- Drop MTP for text-only flow ---
+        provider.mtp_num_layers = None
+
+        # Hybrid GDN/attention layouts require heterogeneous dist_checkpointing.
+        provider.hetereogenous_dist_checkpoint = True
+
+        return provider
+
+    def mapping_registry(self) -> MegatronMappingRegistry:
+        """LM-only HF<->Megatron parameter mapping for Qwen3.5 MoE.
+
+        Megatron-side keys are the LM portion of
+        ``Qwen35VLMoEBridge.mapping_registry()`` with the ``language_model.``
+        prefix removed (GPTModel target). HuggingFace-side keys match the
+        Qwen3.5-35B-A3B-Base safetensors layout: language model params live
+        under ``model.language_model.*`` (same as the dense 4B base model and
+        the VL bridge), and ``lm_head.weight`` is top-level.
+        """
+        param_mappings = {
+            # ---- Embeddings and output ------------------------------------------
+            "embedding.word_embeddings.weight": "model.language_model.embed_tokens.weight",
+            "output_layer.weight": "lm_head.weight",
+            "decoder.final_layernorm.weight": "model.language_model.norm.weight",
+            # ---- MoE router and pre-MLP layernorm --------------------------------
+            "decoder.layers.*.mlp.router.weight": "model.language_model.layers.*.mlp.gate.weight",
+            "decoder.layers.*.pre_mlp_layernorm.weight": (
+                "model.language_model.layers.*.post_attention_layernorm.weight"
+            ),
+            # ---- Standard (Gated) Attention layers --------------------------------
+            "decoder.layers.*.self_attention.linear_qkv.layer_norm_weight": (
+                "model.language_model.layers.*.input_layernorm.weight"
+            ),
+            "decoder.layers.*.self_attention.q_layernorm.weight": (
+                "model.language_model.layers.*.self_attn.q_norm.weight"
+            ),
+            "decoder.layers.*.self_attention.k_layernorm.weight": (
+                "model.language_model.layers.*.self_attn.k_norm.weight"
+            ),
+            "decoder.layers.*.self_attention.linear_proj.weight": (
+                "model.language_model.layers.*.self_attn.o_proj.weight"
+            ),
+            # ---- Linear (Gated DeltaNet) attention layers -------------------------
+            "decoder.layers.*.self_attention.in_proj.layer_norm_weight": (
+                "model.language_model.layers.*.input_layernorm.weight"
+            ),
+            "decoder.layers.*.self_attention.out_proj.weight": (
+                "model.language_model.layers.*.linear_attn.out_proj.weight"
+            ),
+            "decoder.layers.*.self_attention.A_log": (
+                "model.language_model.layers.*.linear_attn.A_log"
+            ),
+            "decoder.layers.*.self_attention.dt_bias": (
+                "model.language_model.layers.*.linear_attn.dt_bias"
+            ),
+        }
+
+        mapping_list = [
+            AutoMapping(megatron_param=mp, hf_param=hp) for mp, hp in param_mappings.items()
+        ]
+
+        # Register module types for AutoMapping shape inference.
+        AutoMapping.register_module_type("SharedExpertMLP", "column")
+        AutoMapping.register_module_type("GatedDeltaNet", "column")
+
+        mapping_list.extend(
+            [
+                # Standard attention QKV: combine separate Q/K/V into linear_qkv.
+                QKVMapping(
+                    megatron_param="decoder.layers.*.self_attention.linear_qkv.weight",
+                    q="model.language_model.layers.*.self_attn.q_proj.weight",
+                    k="model.language_model.layers.*.self_attn.k_proj.weight",
+                    v="model.language_model.layers.*.self_attn.v_proj.weight",
+                ),
+                # GDN: depthwise causal conv1d.
+                GDNConv1dMapping(
+                    megatron_param="decoder.layers.*.self_attention.conv1d.weight",
+                    hf_param="model.language_model.layers.*.linear_attn.conv1d.weight",
+                ),
+                # GDN input projection: 4 separate tensors -> 1 fused tensor.
+                GDNLinearMappingSeparate(
+                    megatron_param="decoder.layers.*.self_attention.in_proj.weight",
+                    qkv="model.language_model.layers.*.linear_attn.in_proj_qkv.weight",
+                    z="model.language_model.layers.*.linear_attn.in_proj_z.weight",
+                    b="model.language_model.layers.*.linear_attn.in_proj_b.weight",
+                    a="model.language_model.layers.*.linear_attn.in_proj_a.weight",
+                ),
+                # GDN output norm: subtract 1 from HF weight (zero-centered gamma).
+                RMSNorm2ZeroCenteredRMSNormMapping(
+                    megatron_param="decoder.layers.*.self_attention.out_norm.weight",
+                    hf_param="model.language_model.layers.*.linear_attn.norm.weight",
+                ),
+                # MoE routed experts: fused gate+up -> linear_fc1, down -> linear_fc2.
+                FusedGatedExpertMapping(
+                    megatron_param="decoder.layers.*.mlp.experts.linear_fc1.weight*",
+                    hf_param="model.language_model.layers.*.mlp.experts.gate_up_proj",
+                ),
+                FusedExpertMapping(
+                    megatron_param="decoder.layers.*.mlp.experts.linear_fc2.weight*",
+                    hf_param="model.language_model.layers.*.mlp.experts.down_proj",
+                    transpose_on_export=True,
+                ),
+                # MoE shared expert: gate+up fused, down passthrough, gate weight replicated.
+                GatedMLPMapping(
+                    megatron_param="decoder.layers.*.mlp.shared_experts.linear_fc1.weight",
+                    gate="model.language_model.layers.*.mlp.shared_expert.gate_proj.weight",
+                    up="model.language_model.layers.*.mlp.shared_expert.up_proj.weight",
+                ),
+                AutoMapping(
+                    megatron_param="decoder.layers.*.mlp.shared_experts.linear_fc2.weight",
+                    hf_param="model.language_model.layers.*.mlp.shared_expert.down_proj.weight",
+                ),
+                ReplicatedMapping(
+                    megatron_param="decoder.layers.*.mlp.shared_experts.gate_weight",
+                    hf_param="model.language_model.layers.*.mlp.shared_expert_gate.weight",
+                ),
+            ]
+        )
+
+        return MegatronMappingRegistry(*mapping_list)
+
+    def load_weights_hf_to_megatron(
+        self,
+        hf_pretrained,
+        megatron_model: Union[MegatronModule, List[MegatronModule]],
+        allowed_mismatched_params: Optional[List[str]] = None,
+    ):
+        """Run the standard HF -> Megatron import and assert all LM params are mapped."""
+        result = super().load_weights_hf_to_megatron(
+            hf_pretrained,
+            megatron_model,
+            allowed_mismatched_params=allowed_mismatched_params,
+        )
+
+        models = result if isinstance(result, list) else [result]
+        unwrapped = unwrap_model(models)
+        registry = self.mapping_registry()
+
+        hf_state_keys = None
+        if hasattr(hf_pretrained, "state") and hasattr(hf_pretrained.state, "source"):
+            try:
+                hf_state_keys = set(hf_pretrained.state.source.get_all_keys())
+            except Exception:
+                hf_state_keys = None
+
+        share_emb = self._share_embeddings_and_output_weights(unwrapped[0].config)
+
+        unmapped: list[str] = []
+        missing_hf: list[tuple[str, str]] = []
+        for model in unwrapped:
+            for name, _ in itertools.chain(model.named_parameters(), persistent_buffers(model)):
+                if "_extra_state" in name or self._is_adapter_param_name(name):
+                    continue
+                if share_emb and "output_layer" in name:
+                    continue
+                clean_name = self._unwrap_name(name)
+                mapping = registry.megatron_to_hf_lookup(self._get_lora_unwrapped_name(clean_name))
+                if mapping is None:
+                    unmapped.append(clean_name)
+                    continue
+                if hf_state_keys is not None and not getattr(mapping, "allow_hf_name_mismatch", False):
+                    hf_param = mapping.hf_param
+                    if isinstance(hf_param, str):
+                        if hf_param not in hf_state_keys:
+                            missing_hf.append((clean_name, hf_param))
+                    else:
+                        for hp in hf_param.values():
+                            if hp not in hf_state_keys:
+                                missing_hf.append((clean_name, hp))
+
+        problems = []
+        if unmapped:
+            problems.append(
+                "Megatron parameters with NO HF mapping (would be left at random init):\n  - "
+                + "\n  - ".join(sorted(set(unmapped)))
+            )
+        if missing_hf:
+            problems.append(
+                "Megatron parameters whose HF source key is missing in the checkpoint "
+                "(would be left at random init):\n  - "
+                + "\n  - ".join(f"{m} <- {h}" for m, h in sorted(set(missing_hf)))
+            )
+        if problems:
+            raise RuntimeError(
+                "Qwen35MoETextBridge: silent conversion gap detected. "
                 "Aborting before save_megatron_model so the checkpoint is not "
                 "shipped with random-init parameters.\n\n" + "\n\n".join(problems)
             )
