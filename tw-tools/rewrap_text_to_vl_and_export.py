@@ -154,23 +154,27 @@ def _resolve_iter_dir(path: str | Path) -> Path:
 
 
 def _build_text_provider(vl_bridge: AutoBridge):
-    """Construct the matching :class:`Qwen35DenseTextProvider` for the LM portion.
+    """Construct the text-only provider matching the VL bridge's architecture.
 
-    Re-uses the same :class:`PreTrainedCausalLM` instance that the VL bridge
-    is operating on (so the language settings are guaranteed to match the
-    HF reference used by the VL provider).
+    Automatically selects between the dense and MoE text bridges by inspecting
+    the HuggingFace model class name. Re-uses the same
+    :class:`PreTrainedCausalLM` instance as the VL bridge so language settings
+    are guaranteed to match.
     """
-    # Local import: env var is already set, so this is safe even when the text
-    # bridge registration is suppressed (we only need the classes themselves).
-    from megatron.bridge.models.qwen.qwen3_5_dense_bridge import (
-        Qwen35DenseTextBridge,
-        Qwen35DenseTextProvider,
-    )
+    hf_class_name = type(vl_bridge.hf_pretrained.model).__name__
 
-    text_bridge = Qwen35DenseTextBridge()
-    provider: Qwen35DenseTextProvider = text_bridge.provider_bridge(vl_bridge.hf_pretrained)
-    # Match the parallelism config of the freshly built VL model so the
-    # sharded_state_dict shapes line up with what the trained ckpt stores.
+    if "Moe" in hf_class_name or "MoE" in hf_class_name:
+        from megatron.bridge.models.qwen.qwen3_5_dense_bridge import (
+            Qwen35MoETextBridge,
+        )
+        text_bridge = Qwen35MoETextBridge()
+    else:
+        from megatron.bridge.models.qwen.qwen3_5_dense_bridge import (
+            Qwen35DenseTextBridge,
+        )
+        text_bridge = Qwen35DenseTextBridge()
+
+    provider = text_bridge.provider_bridge(vl_bridge.hf_pretrained)
     return provider
 
 
