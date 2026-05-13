@@ -67,11 +67,25 @@ fi
 if [[ -z "$MEGATRON_PATH" ]]; then
     SUFFIX=""
     [[ "$TEXT_ONLY" -eq 1 ]] && SUFFIX="-text"
-    MEGATRON_PATH="./megatron_ckpt/$(basename "$HF_MODEL")${SUFFIX}"
+    MEGATRON_PATH="$(pwd)/megatron_ckpt/$(basename "$HF_MODEL")${SUFFIX}"
     EXTRA_ARGS+=("--megatron-path" "$MEGATRON_PATH")
+else
+    # Resolve a user-supplied relative path to absolute so it survives the
+    # SLURM self-resubmission (the job may run with a different CWD).
+    if [[ "$MEGATRON_PATH" != /* ]]; then
+        MEGATRON_PATH="$(pwd)/${MEGATRON_PATH}"
+        # Replace the relative value already stored in EXTRA_ARGS with the
+        # absolute one.
+        for i in "${!EXTRA_ARGS[@]}"; do
+            if [[ "${EXTRA_ARGS[$i]}" == "--megatron-path" ]]; then
+                EXTRA_ARGS[$(( i + 1 ))]="$MEGATRON_PATH"
+                break
+            fi
+        done
+    fi
 fi
 
-BRIDGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BRIDGE_ROOT=$(pwd)
 CONTAINER="/shared_silo/scratch/containers/build-rocm_primus_v25.11_transformers-5.5.4_linear_FA/rocm_primus_v25.11_transformers-5.5.4_linear_FA.sif"
 BIND_PATH="${BIND_PATH:-/shared_silo/scratch}"
 MEGATRON_PATH_ABS="/shared_silo/scratch/rluukkon/oellm/oellm-autoexp/submodules/Megatron-LM"
@@ -119,7 +133,7 @@ echo "========================================"
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 MASTER_PORT="${MASTER_PORT:-29500}"
-
+SLURM_PROCID=0
 srun apptainer exec --rocm \
     -B "${BIND_PATH}:${BIND_PATH}:rw" \
     --env PYTHONPATH="${MEGATRON_PATH_ABS}:${BRIDGE_ROOT}/src" \
