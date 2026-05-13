@@ -246,6 +246,24 @@ Megatron-Bridge/
 
 This section documents the end-to-end workflow for continued pretraining a Qwen3.5 dense model as a text-only `GPTModel` in Megatron-LM and exporting the trained weights back to HuggingFace.  The pipeline is implemented in `tw-tools/` and has been validated on **Qwen3.5-4B-Base** on AMD MI325X hardware.
 
+### Prerequisites — Megatron-LM fork
+
+The TW tools require the [OpenEuroLLM fork of Megatron-LM](https://github.com/OpenEuroLLM/NVIDIA-Megatron-LM/tree/head_nvidia) on the **`head_nvidia`** branch, which carries AMD/ROCm-specific fixes and the GDN layer support needed for Qwen3.5.
+
+Clone the branch and point `MEGATRON_PATH_ABS` inside `tw-tools/import_hf_to_megatron.sh` (and any other TW scripts) to your checkout:
+
+```bash
+git clone --branch head_nvidia \
+    https://github.com/OpenEuroLLM/NVIDIA-Megatron-LM.git \
+    /path/to/NVIDIA-Megatron-LM
+```
+
+Then update the hardcoded line in `tw-tools/import_hf_to_megatron.sh`:
+
+```bash
+MEGATRON_PATH_ABS="/path/to/NVIDIA-Megatron-LM"
+```
+
 ### Architecture notes
 
 The HuggingFace `Qwen3.5-4B-Base` checkpoint carries the class `Qwen3_5ForConditionalGeneration`, which includes a vision tower alongside the language model.  The language model itself is a **hybrid Gated-DeltaNet (GDN) + Gated-Attention** architecture (Qwen3-Next style): every 4th layer is a full-attention layer; the remaining 3 are GDN (state-space) layers.  This requires special handling in the bridge because the GDN `in_proj` and `out_norm` weights need non-trivial remapping.
@@ -255,10 +273,13 @@ The HuggingFace `Qwen3.5-4B-Base` checkpoint carries the class `Qwen3_5ForCondit
 ```bash
 cd /path/to/Megatron-Bridge
 
-sbatch tw-tools/import_hf_to_megatron_tw_text.sh \
-    Qwen/Qwen3.5-4B-Base \
-    ./megatron_ckpt/Qwen3.5-4B-Base
+bash tw-tools/import_hf_to_megatron.sh \
+    --hf-model Qwen/Qwen3.5-4B-Base \
+    --text-only \
+    --megatron-path ./megatron_ckpt/Qwen3.5-4B-Base
 ```
+
+The script self-submits to SLURM via `sbatch` — run it directly with `bash`, not `sbatch`.  An optional `--expert-model-parallel-size N` flag controls EP (and therefore GPU count) for MoE models; it defaults to 1 for dense models.  The `--megatron-path` argument accepts relative or absolute paths; relative paths are resolved to absolute before submission.
 
 This produces a Megatron `torch_dist` checkpoint whose state-dict matches a plain `GPTModel` (no `language_model.` prefix, no vision keys).  The bridge is activated by leaving `BRIDGE_QWEN35_USE_VL` unset (default `0`).
 
@@ -269,7 +290,7 @@ This produces a Megatron `torch_dist` checkpoint whose state-dict matches a plai
 --layernorm-zero-centered-gamma \
 ```
 
-And in your YAML config (`config/backend/megatron/qwen3_5_base.yaml`):
+(oellm-autoexp: (`config/backend/megatron/qwen3_5_base.yaml`):
 
 ```yaml
 normalization: RMSNorm
