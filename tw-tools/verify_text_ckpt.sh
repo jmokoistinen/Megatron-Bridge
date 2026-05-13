@@ -46,9 +46,9 @@ echo "  megatron_path: $MEGATRON_MODEL_PATH"
 echo "  bridge mode  : text-only (BRIDGE_QWEN35_USE_VL=0)"
 echo "========================================"
 
-MEGATRON_PATH="/shared_silo/scratch/rluukkon/oellm/oellm-autoexp/submodules/Megatron-LM"
+MEGATRON_PATH="${BRIDGE_ROOT}/3rdparty/Megatron-LM"
 
-apptainer exec --rocm \
+srun apptainer exec --rocm \
     -B "${BIND_PATH}:${BIND_PATH}:rw" \
     --env PYTHONPATH=$MEGATRON_PATH:${BRIDGE_ROOT}/src \
     --env HSA_FORCE_FINE_GRAIN_PCIE=1 \

@@ -161,7 +161,11 @@ def _build_text_provider(vl_bridge: AutoBridge):
     :class:`PreTrainedCausalLM` instance as the VL bridge so language settings
     are guaranteed to match.
     """
-    hf_class_name = type(vl_bridge.hf_pretrained.model).__name__
+    # Derive the architecture name from the config (no weight load) rather than
+    # from the instantiated model, to avoid a modelopt monkey-patch bug that
+    # crashes AutoModelForCausalLM.from_pretrained on this container image.
+    architectures = getattr(vl_bridge.hf_pretrained.config, "architectures", [])
+    hf_class_name = architectures[0] if architectures else ""
 
     if "Moe" in hf_class_name or "MoE" in hf_class_name:
         from megatron.bridge.models.qwen.qwen3_5_dense_bridge import (
