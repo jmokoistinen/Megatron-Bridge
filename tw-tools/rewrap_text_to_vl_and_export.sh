@@ -7,7 +7,7 @@
 #
 # Usage:
 #   sbatch tw-tools/rewrap_text_to_vl_and_export.sh \
-#       <trained_text_ckpt> <hf_model> <out>
+#       <trained_text_ckpt> <hf_model> <out> [--keep-megatron-vl] [--strict-export]
 #
 # Example:
 #   sbatch tw-tools/rewrap_text_to_vl_and_export.sh \
@@ -20,9 +20,10 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:mi325:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=256G
+#SBATCH --mem=0
 #SBATCH --time=4:00:00
 #SBATCH --open-mode=append
+#SBATCH --exclusive
 #SBATCH --output=logs-convert/rewrap-export-%j.out
 #SBATCH --error=logs-convert/rewrap-export-%j.err
 
@@ -31,6 +32,9 @@ set -euo pipefail
 TRAINED_TEXT_CKPT="${1:?Usage: sbatch $0 <trained_text_ckpt> <hf_model> <out>}"
 HF_MODEL="${2:?missing hf_model}"
 OUT="${3:?missing out}"
+# Any extra positional args (e.g. --keep-megatron-vl, --strict-export) are
+# forwarded verbatim to the Python script below.
+EXTRA_ARGS=("${@:4}")
 
 BRIDGE_ROOT="./"
 CONTAINER="/shared_silo/scratch/containers/build-rocm_primus_v25.11_transformers-5.5.4_linear_FA/rocm_primus_v25.11_transformers-5.5.4_linear_FA.sif"
@@ -62,11 +66,13 @@ srun apptainer exec --rocm \
     --env MIOPEN_CACHE_DIR=/tmp/miopen-cache-${SLURM_JOB_ID} \
     --env RCCL_MSCCL_ENABLE=0 \
     --env BRIDGE_QWEN35_USE_VL=1 \
+    --env BRIDGE_QWEN35_MOE_USE_VL=1 \
     "$CONTAINER" \
     python "${BRIDGE_ROOT}/tw-tools/rewrap_text_to_vl_and_export.py" \
         --trained-text-ckpt "$TRAINED_TEXT_CKPT" \
         --hf-model          "$HF_MODEL" \
-        --out               "$OUT"
+        --out               "$OUT" \
+        "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
 
 echo "Done."
 echo "  HuggingFace VL   : $OUT"

@@ -59,8 +59,16 @@ from pathlib import Path
 from typing import Iterable
 
 # IMPORTANT: must be set BEFORE any megatron.bridge imports so the VL bridge
-# wins the dispatch slot for ``Qwen3_5ForConditionalGeneration``.
+# wins the dispatch slot for ``Qwen3_5ForConditionalGeneration`` (dense).
+# For MoE models (Qwen3_5MoeForCausalLM) we bypass AutoBridge dispatch entirely
+# via _make_vl_auto_bridge(), so this env var is only strictly required for the
+# dense path.  Keep it as a setdefault so it can still be overridden.
 os.environ.setdefault("BRIDGE_QWEN35_USE_VL", "1")
+# Prevent Qwen35MoETextBridge from occupying the Qwen3_5MoeForCausalLM dispatch
+# slot.  Without this, AutoBridge.from_hf_pretrained on a base MoE text model
+# returns a text (GPTModel) bridge, causing all language_model.* key lookups in
+# _iter_lm_pairs to fail and every trained weight to be silently dropped.
+os.environ.setdefault("BRIDGE_QWEN35_MOE_USE_VL", "1")
 
 import torch  # noqa: E402
 
@@ -153,6 +161,50 @@ def _resolve_iter_dir(path: str | Path) -> Path:
     return iter_dirs[-1]
 
 
+def _make_vl_auto_bridge(hf_model_path: str) -> AutoBridge:
+    """Return an AutoBridge backed by the correct *VL* bridge for this model.
+
+    ``AutoBridge.from_hf_pretrained`` dispatches on ``config.architectures[0]``.
+    For a base text MoE model (``Qwen3_5MoeForCausalLM``) this would land on
+    ``Qwen35MoETextBridge`` (GPTModel target), which has no ``language_model.*``
+    prefix in its Megatron state dict.  Every ``language_model.{gpt_key}`` lookup
+    in :func:`_iter_lm_pairs` would then fail, silently dropping all ~21 k
+    trained parameters and leaving the output identical to the original HF model.
+
+    To avoid this, we inspect the architecture ourselves and directly instantiate
+    either :class:`Qwen35VLMoEBridge` (MoE) or :class:`Qwen35VLBridge` (dense),
+    then wrap it in a lightweight ``AutoBridge`` subclass so the rest of
+    ``main()`` (``to_megatron_model``, ``save_megatron_model``, ``export_ckpt``)
+    works without modification.
+    """
+    # Late imports so the env vars set at module top take effect first.
+    from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM  # noqa: PLC0415
+
+    hf_model = PreTrainedCausalLM.from_pretrained(hf_model_path)
+    architectures = getattr(hf_model.config, "architectures", [])
+    hf_class_name = architectures[0] if architectures else ""
+    is_moe = "Moe" in hf_class_name or "MoE" in hf_class_name
+
+    if is_moe:
+        from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import Qwen35VLMoEBridge  # noqa: PLC0415
+        vl_impl = Qwen35VLMoEBridge()
+        logger.info("VL bridge selected: Qwen35VLMoEBridge (MoE, %s)", hf_class_name)
+    else:
+        from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import Qwen35VLBridge  # noqa: PLC0415
+        vl_impl = Qwen35VLBridge()
+        logger.info("VL bridge selected: Qwen35VLBridge (dense, %s)", hf_class_name)
+
+    class _VLAutobridge(AutoBridge):
+        """AutoBridge subclass that forces a specific bridge implementation."""
+
+        @property
+        def _model_bridge(self):  # type: ignore[override]
+            vl_impl.export_weight_dtype = self.export_weight_dtype
+            return vl_impl
+
+    return _VLAutobridge(hf_model)
+
+
 def _build_text_provider(vl_bridge: AutoBridge):
     """Construct the text-only provider matching the VL bridge's architecture.
 
@@ -199,8 +251,10 @@ def main() -> int:
     args = parse_args()
 
     if os.environ.get("BRIDGE_QWEN35_USE_VL", "0") != "1":
-        # We set the default at module load. If the user explicitly overrode it
-        # to 0, abort early with a clear diagnostic rather than failing later.
+        # We set the default at module load (dense path).  Abort if the caller
+        # explicitly overrode it to 0 to avoid a hard-to-debug silent failure on
+        # dense models.  For MoE models this env var is not used (dispatch is
+        # handled inside _make_vl_auto_bridge), so the guard is a no-op there.
         raise RuntimeError(
             "rewrap_text_to_vl_and_export.py requires BRIDGE_QWEN35_USE_VL=1 so the "
             "Qwen3.5 dense VL bridge is registered. Refusing to continue with VL=0."
@@ -221,7 +275,7 @@ def main() -> int:
     # Phase 1: build VL model from HF, overwrite LM weights, save.
     # ------------------------------------------------------------------
     with temporary_distributed_context(backend="gloo"):
-        vl_bridge = AutoBridge.from_hf_pretrained(args.hf_model)
+        vl_bridge = _make_vl_auto_bridge(args.hf_model)
         logger.info("Loaded HF reference into AutoBridge: %s", type(vl_bridge._model_bridge).__name__)
 
         # Build the text-only GPTModel FIRST, before to_megatron_model().
@@ -355,7 +409,7 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Phase 2: HuggingFace export (opens its own dist context).
     # ------------------------------------------------------------------
-    export_bridge = AutoBridge.from_hf_pretrained(args.hf_model)
+    export_bridge = _make_vl_auto_bridge(args.hf_model)
     export_bridge.export_ckpt(
         out_megatron_vl,
         out_hf,
