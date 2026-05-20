@@ -247,6 +247,90 @@ def _iter_lm_pairs(gpt_state: dict, vl_state: dict) -> Iterable[tuple[str, str]]
             yield gpt_key, target
 
 
+def _copy_preprocessor_config(hf_model_path: str, out_hf: str) -> None:
+    """Copy preprocessor_config.json into the HF export directory if absent.
+
+    When ``--hf-model`` is a base text model the export directory will be
+    missing ``preprocessor_config.json``, causing vLLM / transformers to fail
+    at initialisation even for text-only inference.  We resolve this by:
+
+    1. Checking if the HF source model already has the file (ideal case when a
+       proper VL model is provided).
+    2. Otherwise scanning sibling directories of the HF source for a
+       ``preprocessor_config.json`` whose companion ``config.json`` declares a
+       ``vision_config`` with the same ``depth`` and ``hidden_size`` as the
+       exported model.  This handles the common case where all Qwen3.5-VL
+       variants share the same vision encoder.
+
+    A warning is emitted if no compatible file is found; the export is still
+    valid for environments that don't require the image processor.
+    """
+    import json as _json
+    import shutil as _shutil
+
+    out_path = Path(out_hf) / "preprocessor_config.json"
+    if out_path.exists():
+        return  # already written by export_ckpt or a previous run
+
+    # 1. Direct copy from source
+    src = Path(hf_model_path) / "preprocessor_config.json"
+    if src.exists():
+        _shutil.copy2(src, out_path)
+        logger.info("Copied preprocessor_config.json from %s", hf_model_path)
+        return
+
+    # 2. Find a compatible file in sibling directories.
+    export_cfg_path = Path(out_hf) / "config.json"
+    if not export_cfg_path.exists():
+        logger.warning(
+            "No preprocessor_config.json in HF source and export config.json not found; "
+            "skipping preprocessor copy."
+        )
+        return
+
+    try:
+        export_cfg = _json.loads(export_cfg_path.read_text())
+        export_vc = export_cfg.get("vision_config") or {}
+        want_depth = export_vc.get("depth")
+        want_hidden = export_vc.get("hidden_size")
+    except Exception as exc:
+        logger.warning("Could not read exported config.json (%s); skipping preprocessor copy.", exc)
+        return
+
+    search_root = Path(hf_model_path).parent
+    for sibling in sorted(search_root.iterdir()):
+        candidate = sibling / "preprocessor_config.json"
+        cfg_file = sibling / "config.json"
+        if not candidate.exists() or not cfg_file.exists():
+            continue
+        try:
+            sib_cfg = _json.loads(cfg_file.read_text())
+            sib_vc = sib_cfg.get("vision_config") or {}
+            if (want_depth is None or sib_vc.get("depth") == want_depth) and (
+                want_hidden is None or sib_vc.get("hidden_size") == want_hidden
+            ):
+                _shutil.copy2(candidate, out_path)
+                logger.info(
+                    "Copied compatible preprocessor_config.json from %s "
+                    "(vision depth=%s hidden=%s)",
+                    sibling,
+                    want_depth,
+                    want_hidden,
+                )
+                return
+        except Exception:
+            continue
+
+    logger.warning(
+        "No preprocessor_config.json found for vision_config depth=%s hidden_size=%s. "
+        "Text inference will work, but VL and image-processor-dependent tools will fail. "
+        "Copy a compatible preprocessor_config.json manually into %s.",
+        want_depth,
+        want_hidden,
+        out_hf,
+    )
+
+
 def main() -> int:
     args = parse_args()
 
@@ -417,6 +501,14 @@ def main() -> int:
         strict=args.strict_export,
     )
     logger.info("Wrote HuggingFace VL safetensors to %s", out_hf)
+
+    # Copy preprocessor_config.json from the HF reference if present.
+    # When --hf-model is a base text model it won't have one, but the exported
+    # VL checkpoint still declares a full VL architecture, so vLLM / transformers
+    # will fail to initialise it without the image-processor config.
+    # Look for the file in the HF model directory and in any sibling directory
+    # whose vision_config matches (same depth + hidden_size).
+    _copy_preprocessor_config(args.hf_model, out_hf)
 
     if not args.keep_megatron_vl:
         breadcrumb = Path(out_megatron_vl) / "_REWRAP_INTERMEDIATE.md"
