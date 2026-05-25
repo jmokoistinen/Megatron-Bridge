@@ -20,10 +20,9 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:mi325:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=0
-#SBATCH --time=4:00:00
-#SBATCH --open-mode=append
-#SBATCH --exclusive
+#SBATCH --mem=220G
+#SBATCH --time=1:00:00
+## SBATCH --exclusive
 #SBATCH --output=logs-convert/rewrap-export-%j.out
 #SBATCH --error=logs-convert/rewrap-export-%j.err
 
@@ -48,7 +47,6 @@ echo "Qwen3.5 re-wrap (text → VL) and HF export"
 echo "  trained text ckpt : $TRAINED_TEXT_CKPT"
 echo "  HF reference      : $HF_MODEL"
 echo "  out (HF VL)       : $OUT"
-echo "  out (Megatron VL) : ${OUT}_megatron_vl  [intermediate, can delete after]"
 echo "  bridge_root       : $BRIDGE_ROOT"
 echo "  job_id            : $SLURM_JOB_ID"
 echo "  bridge mode       : VL (BRIDGE_QWEN35_USE_VL=1)"
@@ -76,4 +74,3 @@ srun apptainer exec --rocm \
 
 echo "Done."
 echo "  HuggingFace VL   : $OUT"
-echo "  Megatron VL (intermediate): ${OUT}_megatron_vl"

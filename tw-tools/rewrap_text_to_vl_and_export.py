@@ -21,18 +21,18 @@ This is stage 3 of the text-only CPT pipeline:
              HF Qwen3.5-XB-Base  -->  Megatron text-only ckpt (GPTModel keys)
     stage 2: oellm-autoexp Megatron-LM ``pretrain_gpt.py``
              continued pretraining on text data only
-    stage 3: this script
+    stage 3: this script (single in-memory pass, no intermediate checkpoint)
              1. load the *original* HF VL model (vision tower preserved)
              2. convert it to a Megatron VL model in memory
              3. overwrite the language_model.* weights with the trained
                 Megatron text checkpoint
-             4. ``bridge.save_megatron_model`` -> a fresh Bridge VL ckpt
-             5. ``bridge.export_ckpt`` -> HuggingFace VL safetensors
+             4. ``bridge.save_hf_pretrained`` -> HuggingFace VL safetensors
 
 The actual Megatron->HF parameter remapping (QKV split, GDN ``in_proj`` split
 into ``in_proj_qkv/z/b/a``, RMSNorm zero-centering reverse, etc.) is handled
 entirely by the existing ``Qwen35VLBridge.mapping_registry()``; this script
-just stages the inputs.
+just stages the inputs.  No intermediate Megatron Bridge VL checkpoint is
+written to disk; the remapped model is exported directly from memory.
 
 Vision parameters in the output are byte-identical to the original HuggingFace
 release (they were never on a GPU during stage 2). The language model has
@@ -52,9 +52,11 @@ Example (single-GPU)::
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Iterable
 
@@ -79,6 +81,108 @@ from megatron.core.utils import init_method_normal, scaled_init_method_normal, u
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("rewrap-text-to-vl")
+
+
+def _rss_gb() -> float:
+    """Return current process RSS in GiB. Uses psutil if available, else resource."""
+    try:
+        import psutil  # type: ignore[import-untyped]
+        return psutil.Process().memory_info().rss / 1024 ** 3
+    except ImportError:
+        import resource
+        # getrusage ru_maxrss is in kilobytes on Linux, bytes on macOS
+        kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return kb / 1024 ** 2  # convert to GiB (Linux: KB→GiB)
+
+
+class MemoryTracker:
+    """Background-thread RSS sampler with labeled checkpoints.
+
+    Spawns a daemon thread that polls ``_rss_gb()`` every ``interval`` seconds.
+    Call ``checkpoint(label)`` at key points to record the current RSS and
+    reset the per-phase peak counter.  Call ``stop()`` (or use as a context
+    manager) to join the thread and print the full summary.
+
+    Usage::
+
+        with MemoryTracker() as mem:
+            mem.checkpoint("start")
+            heavy_operation()
+            mem.checkpoint("after heavy_operation")
+    """
+
+    def __init__(self, interval: float = 2.0) -> None:
+        self._interval = interval
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._global_peak: float = 0.0
+        self._phase_peak: float = 0.0
+        self._phase_label: str = "init"
+        self._log: list[tuple[str, float, float]] = []  # (label, rss_at_checkpoint, phase_peak)
+        self._thread = threading.Thread(target=self._sample_loop, daemon=True, name="mem-tracker")
+        self._thread.start()
+
+    def _sample_loop(self) -> None:
+        while not self._stop_event.is_set():
+            rss = _rss_gb()
+            with self._lock:
+                if rss > self._phase_peak:
+                    self._phase_peak = rss
+                if rss > self._global_peak:
+                    self._global_peak = rss
+            self._stop_event.wait(self._interval)
+
+    def checkpoint(self, label: str) -> None:
+        """Log current RSS, flush phase peak, and start a new phase."""
+        rss = _rss_gb()
+        with self._lock:
+            if rss > self._phase_peak:
+                self._phase_peak = rss
+            if rss > self._global_peak:
+                self._global_peak = rss
+            entry = (self._phase_label, rss, self._phase_peak)
+            self._log.append(entry)
+            self._phase_label = label
+            self._phase_peak = rss
+        logger.info("[mem] %-42s  rss=%5.1f GB  phase-peak=%5.1f GB", label, rss, entry[2])
+
+    def stop(self) -> None:
+        """Stop the background thread and print the full summary."""
+        self._stop_event.set()
+        self._thread.join(timeout=self._interval * 2)
+        # Flush the final phase.
+        rss = _rss_gb()
+        with self._lock:
+            if rss > self._phase_peak:
+                self._phase_peak = rss
+            if rss > self._global_peak:
+                self._global_peak = rss
+            self._log.append((self._phase_label, rss, self._phase_peak))
+            global_peak = self._global_peak
+            log = list(self._log)
+
+        lines = [
+            "",
+            "=" * 62,
+            "  Memory usage summary",
+            "=" * 62,
+            f"  {'Phase / checkpoint':<40}  {'RSS':>6}  {'Peak':>6}",
+            "  " + "-" * 58,
+        ]
+        for label, rss_at, peak in log:
+            lines.append(f"  {label:<40}  {rss_at:5.1f}G  {peak:5.1f}G")
+        lines += [
+            "  " + "-" * 58,
+            f"  {'GLOBAL PEAK':<40}  {'':>6}  {global_peak:5.1f}G",
+            "=" * 62,
+        ]
+        logger.info("\n".join(lines))
+
+    def __enter__(self) -> "MemoryTracker":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.stop()
 
 
 _ITERATION_DIR_PREFIX = "iter_"
@@ -110,22 +214,13 @@ def parse_args() -> argparse.Namespace:
         "--out",
         required=True,
         type=str,
-        help=(
-            "Output directory for the final HuggingFace VL safetensors. "
-            "An intermediate Megatron Bridge VL checkpoint is saved alongside "
-            "at ``<out>_megatron_vl`` and can be deleted after a successful export."
-        ),
+        help="Output directory for the HuggingFace VL safetensors.",
     )
     parser.add_argument(
         "--strict-export",
         action="store_true",
-        help="Pass ``strict=True`` to ``export_ckpt`` (disabled by default to "
+        help="Pass ``strict=True`` to ``save_hf_pretrained`` (disabled by default to "
         "tolerate harmless key drops such as MTP).",
-    )
-    parser.add_argument(
-        "--keep-megatron-vl",
-        action="store_true",
-        help="Keep the intermediate rewrapped Megatron VL checkpoint after a successful HF export.",
     )
     return parser.parse_args()
 
@@ -174,8 +269,8 @@ def _make_vl_auto_bridge(hf_model_path: str) -> AutoBridge:
     To avoid this, we inspect the architecture ourselves and directly instantiate
     either :class:`Qwen35VLMoEBridge` (MoE) or :class:`Qwen35VLBridge` (dense),
     then wrap it in a lightweight ``AutoBridge`` subclass so the rest of
-    ``main()`` (``to_megatron_model``, ``save_megatron_model``, ``export_ckpt``)
-    works without modification.
+    ``_run()`` (``to_megatron_model``, ``save_hf_pretrained``) works without
+    modification.
     """
     # Late imports so the env vars set at module top take effect first.
     from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM  # noqa: PLC0415
@@ -344,23 +439,31 @@ def main() -> int:
             "Qwen3.5 dense VL bridge is registered. Refusing to continue with VL=0."
         )
 
+    mem = MemoryTracker()
+    try:
+        return _run(args, mem)
+    finally:
+        mem.stop()
+
+
+def _run(args: argparse.Namespace, mem: MemoryTracker) -> int:
+    from megatron.bridge.training.model_load_save import temporary_distributed_context
+
     trained_text_iter_dir = _resolve_iter_dir(args.trained_text_ckpt)
     out_hf = args.out
-    out_megatron_vl = str(Path(args.out).with_name(Path(args.out).name + "_megatron_vl"))
 
     logger.info("Trained text checkpoint:        %s", trained_text_iter_dir)
     logger.info("HuggingFace reference:          %s", args.hf_model)
     logger.info("Output (HuggingFace VL):        %s", out_hf)
-    logger.info("Output (Megatron VL, intermediate): %s", out_megatron_vl)
-
-    from megatron.bridge.training.model_load_save import temporary_distributed_context
 
     # ------------------------------------------------------------------
-    # Phase 1: build VL model from HF, overwrite LM weights, save.
+    # Build VL model from HF, overwrite LM weights, export to HF.
     # ------------------------------------------------------------------
+    mem.checkpoint("start")
     with temporary_distributed_context(backend="gloo"):
         vl_bridge = _make_vl_auto_bridge(args.hf_model)
         logger.info("Loaded HF reference into AutoBridge: %s", type(vl_bridge._model_bridge).__name__)
+        mem.checkpoint("after load HF model (vl_bridge)")
 
         # Build the text-only GPTModel FIRST, before to_megatron_model().
         # provide() is a low-level call that hits _initialize_affine_weight_gpu
@@ -396,6 +499,7 @@ def main() -> int:
         )[0]
         gpt_sharded = gpt_model.sharded_state_dict()
         logger.info("Bare GPTModel built; %d sharded entries", len(gpt_sharded))
+        mem.checkpoint("after build GPTModel (bare)")
 
         loaded_gpt = dist_checkpointing.load(gpt_sharded, str(trained_text_iter_dir))
         # dist_checkpointing.load may return checkpoint-level metadata keys
@@ -406,6 +510,23 @@ def main() -> int:
             strict=True,
         )
         logger.info("Trained text checkpoint loaded into GPTModel (%d tensors).", len(loaded_gpt))
+        mem.checkpoint("after load trained checkpoint into GPTModel")
+
+        # Extract the trained weights as a plain state dict.  state_dict()
+        # returns tensor references that share storage with the model
+        # parameters, so the data stays alive after gpt_model is deleted.
+        # Strip any "module." prefix that Megatron's DDP/wrapper might add.
+        gpt_state = {
+            (k[len("module.") :] if k.startswith("module.") else k): v
+            for k, v in gpt_model.state_dict().items()
+        }
+
+        # Free the GPT model and raw checkpoint tensors before building the
+        # much larger VL model.  gpt_state keeps the parameter storages alive.
+        del gpt_model, gpt_model_list, loaded_gpt
+        gc.collect()
+        mem.checkpoint("after free GPTModel+loaded_gpt")
+        logger.info("GPTModel freed; building VL model.")
 
         # Now build the full VL model from the original HF weights. Vision-tower
         # weights come from HF directly; LM weights will be overwritten below.
@@ -417,15 +538,11 @@ def main() -> int:
             "Vision-tower weights are populated; LM weights will be overwritten.",
             len(vl_models),
         )
+        mem.checkpoint("after build VL model (to_megatron_model)")
 
         # ------------------------------------------------------------------
         # Overwrite language_model.* in the VL model with the trained weights.
         # ------------------------------------------------------------------
-        gpt_state = dict(gpt_model.state_dict())
-        # Strip any "module." prefix that Megatron's DDP/wrapper might add.
-        gpt_state = {
-            (k[len("module.") :] if k.startswith("module.") else k): v for k, v in gpt_state.items()
-        }
 
         n_copied = 0
         n_lm_keys_in_vl = 0
@@ -472,35 +589,28 @@ def main() -> int:
             n_skipped,
         )
 
-        # Free the GPTModel before save to reduce peak memory.
-        del gpt_model
+        # Free the trained-weight state dict now that all tensors have been
+        # copied into vl_models.  (gpt_model and loaded_gpt were already freed
+        # before to_megatron_model to keep peak memory lower.)
         del gpt_state
-        del loaded_gpt
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        mem.checkpoint("after free gpt_state (weight copy done)")
 
         # ------------------------------------------------------------------
-        # Save the rewrapped VL checkpoint in Megatron Bridge format.
+        # Export directly to HuggingFace format — no intermediate checkpoint.
+        # save_hf_pretrained accepts the in-memory vl_models list and uses the
+        # bridge's mapping registry for the Megatron→HF weight remapping.
         # ------------------------------------------------------------------
-        vl_bridge.save_megatron_model(
+        vl_bridge.save_hf_pretrained(
             vl_models,
-            out_megatron_vl,
-            hf_tokenizer_path=args.hf_model,
-            low_memory_save=True,
+            out_hf,
+            show_progress=True,
+            strict=args.strict_export,
         )
-        logger.info("Wrote rewrapped Megatron VL checkpoint to %s", out_megatron_vl)
-
-    # ------------------------------------------------------------------
-    # Phase 2: HuggingFace export (opens its own dist context).
-    # ------------------------------------------------------------------
-    export_bridge = _make_vl_auto_bridge(args.hf_model)
-    export_bridge.export_ckpt(
-        out_megatron_vl,
-        out_hf,
-        show_progress=True,
-        strict=args.strict_export,
-    )
-    logger.info("Wrote HuggingFace VL safetensors to %s", out_hf)
+        logger.info("Wrote HuggingFace VL safetensors to %s", out_hf)
+        mem.checkpoint("after save_hf_pretrained")
 
     # Copy preprocessor_config.json from the HF reference if present.
     # When --hf-model is a base text model it won't have one, but the exported
@@ -509,17 +619,6 @@ def main() -> int:
     # Look for the file in the HF model directory and in any sibling directory
     # whose vision_config matches (same depth + hidden_size).
     _copy_preprocessor_config(args.hf_model, out_hf)
-
-    if not args.keep_megatron_vl:
-        breadcrumb = Path(out_megatron_vl) / "_REWRAP_INTERMEDIATE.md"
-        try:
-            breadcrumb.write_text(
-                "This checkpoint was produced by rewrap_text_to_vl_and_export.py as an\n"
-                "intermediate before HF export. It can be deleted unless you want to\n"
-                "re-export with different settings without rerunning the rewrap step.\n"
-            )
-        except OSError:
-            pass
 
     return 0
 
