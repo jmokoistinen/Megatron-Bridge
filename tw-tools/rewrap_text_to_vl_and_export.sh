@@ -43,6 +43,10 @@ mkdir -p "${BRIDGE_ROOT}/logs-convert"
 mkdir -p "$(dirname "$OUT")"
 
 echo "========================================"
+# Clock time at the start of the script in DD/MM/YYYY HH:MM:SS format
+start_time=$(date +%s)
+echo "Start time: $(date -d @$start_time +%Y-%m-%d\ %H:%M:%S)"
+
 echo "Qwen3.5 re-wrap (text → VL) and HF export"
 echo "  trained text ckpt : $TRAINED_TEXT_CKPT"
 echo "  HF reference      : $HF_MODEL"
@@ -74,3 +78,9 @@ srun apptainer exec --rocm \
 
 echo "Done."
 echo "  HuggingFace VL   : $OUT"
+# Clock time at the end of the script in DD/MM/YYYY HH:MM:SS format
+end_time=$(date +%s)
+echo "End time: $(date -d @$end_time +%Y-%m-%d\ %H:%M:%S)"
+# Calculate the duration of the script in seconds
+duration=$((end_time - start_time))
+echo "Duration: $(date -d @$duration +%H:%M:%S)"

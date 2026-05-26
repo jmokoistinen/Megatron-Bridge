@@ -72,15 +72,21 @@ os.environ.setdefault("BRIDGE_QWEN35_USE_VL", "1")
 # _iter_lm_pairs to fail and every trained weight to be silently dropped.
 os.environ.setdefault("BRIDGE_QWEN35_MOE_USE_VL", "1")
 
+# Configure logging BEFORE importing torch/megatron — basicConfig() is a no-op
+# if any library in the import chain adds a handler to the root logger first.
+# force=True overrides any handlers added during import as an extra safeguard.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,
+)
+logger = logging.getLogger("rewrap-text-to-vl")
+
 import torch  # noqa: E402
 
 from megatron.bridge import AutoBridge  # noqa: E402
 from megatron.core import dist_checkpointing  # noqa: E402
 from megatron.core.utils import init_method_normal, scaled_init_method_normal, unwrap_model  # noqa: E402
-
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-logger = logging.getLogger("rewrap-text-to-vl")
 
 
 def _rss_gb() -> float:
