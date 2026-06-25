@@ -510,10 +510,17 @@ def _run(args: argparse.Namespace, mem: MemoryTracker) -> int:
         loaded_gpt = dist_checkpointing.load(gpt_sharded, str(trained_text_iter_dir))
         # dist_checkpointing.load may return checkpoint-level metadata keys
         # (e.g. "checkpoint_version", "iteration") alongside model weights.
-        model_param_keys = set(gpt_model.state_dict().keys())
+        # Drop TE _extra_state tensors (FP8 scaling factors) — they are not
+        # model weights and their serialisation format varies across TE
+        # versions, causing EOFError when the conversion container has a
+        # different TE than the training container.
+        model_param_keys = {
+            k for k in gpt_model.state_dict().keys()
+            if "_extra_state" not in k
+        }
         gpt_model.load_state_dict(
             {k: v for k, v in loaded_gpt.items() if k in model_param_keys},
-            strict=True,
+            strict=False,
         )
         logger.info("Trained text checkpoint loaded into GPTModel (%d tensors).", len(loaded_gpt))
         mem.checkpoint("after load trained checkpoint into GPTModel")
