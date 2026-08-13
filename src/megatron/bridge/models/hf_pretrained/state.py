@@ -759,7 +759,7 @@ class SafeTensorsStateSource(StateSource):
                     print(f"Warning: tensor '{name}' from generator not found in original model structure. Skipping.")
                     continue
 
-            buffered_tensors[name] = tensor
+            buffered_tensors[name] = tensor.contiguous() if hasattr(tensor, "contiguous") else tensor
 
             # Check if any file is complete and can be saved.
             # Iterate over a copy of keys since we might modify the dict.
@@ -956,7 +956,7 @@ class SafeTensorsStateSource(StateSource):
                 fname = key_to_filename_map[name]
                 if fname not in assigned_filenames_set:
                     continue
-                buffered_tensors[name] = tensor
+                buffered_tensors[name] = tensor.contiguous() if hasattr(tensor, "contiguous") else tensor
 
         if is_saver_rank:
             missing_keys = assigned_expected_keys - set(buffered_tensors.keys())
